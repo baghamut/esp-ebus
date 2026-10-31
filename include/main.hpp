@@ -21,8 +21,10 @@
 #define UPDATE_MAX_MS (10UL * 60 * 1000)
 // Task watchdog timeout for the main loop and the data loop
 #define TASK_WDT_TIMEOUT_S 6
-// How long to retry the rest of a partially written enhanced frame
-#define CLIENT_PARTIAL_WRITE_MS 50
+// Per-client output buffer used while a socket is busy (~2 s of bus data)
+#define CLIENT_BUFFER_SIZE 512
+// One buffer per client slot: plain, read-only and enhanced servers
+#define CLIENT_BUFFER_SLOTS (3 * MAX_SRV_CLIENTS)
 
 #ifdef ESP32
 #define UART_TX 20
@@ -44,12 +46,13 @@ int DEBUG_LOG_IMPL(const char *format, ...);
 
 bool   handleNewClient(WiFiServer &server, WiFiClient clients[]);
 size_t clientWrite(WiFiClient* client, const uint8_t* buf, size_t size);
+void   clientFlush(WiFiClient* client);
 int    pushClient(WiFiClient* client, uint8_t B);
 void   handleClient(WiFiClient* client);
 
-// Data that could not be delivered because a client socket was busy
+// Data dropped because a client's output buffer was full
 extern volatile unsigned long nbrClientDrops;
-// Clients closed because of a socket error or a broken enhanced frame
+// Clients closed because of a socket error
 extern volatile unsigned long nbrClientStops;
 
 

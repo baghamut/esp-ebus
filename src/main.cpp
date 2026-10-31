@@ -227,6 +227,13 @@ void check_reset() {
 void loop_duration() {
   static unsigned long lastTime = 0;
   unsigned long now = micros();
+
+  // The first call would measure the whole boot time as one "loop"
+  if (lastTime == 0) {
+    lastTime = now;
+    return;
+  }
+
   unsigned long delta = now - lastTime;
 
   lastTime = now;
@@ -254,10 +261,13 @@ bool any_client_connected(){
 void data_process(){
   loop_duration();
 
-  //check clients for data
+  //check clients for data, push out data buffered while a socket was busy
   for (int i = 0; i < MAX_SRV_CLIENTS; i++){
     handleClient(&serverClients[i]);
     handleEnhClient(&enhClients[i]);
+    clientFlush(&serverClients[i]);
+    clientFlush(&serverClientsRO[i]);
+    clientFlush(&enhClients[i]);
   }
 
   // Nobody to deliver to is not a communication failure

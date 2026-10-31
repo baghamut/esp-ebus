@@ -35,56 +35,153 @@ bool handleNewClient(WiFiServer &server, WiFiClient clients[]) {
   return true;
 }
 
-// Write to a client without ever blocking the data loop.
+#ifdef ESP32
+// Non-blocking client output with a small per-client buffer.
 //
 // On ESP32, WiFiClient::write() waits in select() up to 10 x 1 s when the
-// socket send queue is full, and availableForWrite() always returns 0, so the
-// old threshold check never helped. One slow client could stall delivery to
-// everybody and overflow the bus queue. Here we send with MSG_DONTWAIT:
-// - all bytes sent           -> return size
-// - socket busy, nothing sent -> drop the data for this client, return 0
-// - socket error             -> stop the client, return 0
-// A partial write (only possible for multi-byte enhanced frames) would break
-// the protocol stream, so the remainder gets a short bounded retry and the
-// client is stopped if it still does not fit.
+// socket send queue is full, and availableForWrite() always returns 0, so
+// the old threshold check never helped: one slow client stalled the data
+// loop for seconds and the bus queue overflowed.
+//
+// With TCP_NODELAY every bus byte is its own segment, and lwIP queues only
+// a few unacknowledged segments per socket, so "send queue full" happens
+// whenever ACKs are a bit late on Wi-Fi. Instead of blocking or dropping,
+// bytes are kept in a per-client buffer and sent with MSG_DONTWAIT on the
+// next call, which also merges them into one segment. Data is only dropped
+// when a client's buffer is full (it stopped reading for ~2 s of bus data).
+
+struct ClientBuffer {
+  WiFiClient* client;
+  int         fd;
+  uint16_t    len;
+  uint8_t     data[CLIENT_BUFFER_SIZE];
+};
+
+static ClientBuffer buffers[CLIENT_BUFFER_SLOTS];
+
+static ClientBuffer* bufferFor(WiFiClient* client, int fd) {
+  ClientBuffer* free_slot = nullptr;
+  for (int i = 0; i < CLIENT_BUFFER_SLOTS; i++) {
+    if (buffers[i].client == client) {
+      if (buffers[i].fd != fd) {
+        // A new connection in the same client slot: forget old data
+        buffers[i].fd = fd;
+        buffers[i].len = 0;
+      }
+      return &buffers[i];
+    }
+    if (free_slot == nullptr && buffers[i].client == nullptr) {
+      free_slot = &buffers[i];
+    }
+  }
+  if (free_slot != nullptr) {
+    free_slot->client = client;
+    free_slot->fd = fd;
+    free_slot->len = 0;
+  }
+  return free_slot;
+}
+
+static void stopClient(WiFiClient* client, ClientBuffer* buffer) {
+  nbrClientStops++;
+  if (buffer != nullptr) {
+    buffer->len = 0;
+  }
+  client->stop();
+}
+
+// Send as much of the buffered data as the socket takes right now.
+// Returns false if the client was stopped because of a socket error.
+static bool flushBuffer(WiFiClient* client, ClientBuffer* buffer) {
+  if (buffer->len == 0)
+    return true;
+
+  int res = send(buffer->fd, buffer->data, buffer->len, MSG_DONTWAIT);
+  if (res > 0) {
+    buffer->len -= res;
+    if (buffer->len > 0) {
+      memmove(buffer->data, buffer->data + res, buffer->len);
+    }
+    return true;
+  }
+  if (res < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+    stopClient(client, buffer);
+    return false;
+  }
+  return true;  // socket busy, try again later
+}
+#endif
+
+// Queue data for a client without ever blocking. Multi-byte data (enhanced
+// frames) is taken whole or not at all, so the protocol stream stays intact.
+// Returns size if the data was sent or buffered, 0 if it was dropped.
 size_t clientWrite(WiFiClient* client, const uint8_t* buf, size_t size) {
 #ifdef ESP32
   int fd = client->fd();
   if (fd < 0)
     return 0;
 
-  size_t sent = 0;
-  unsigned long start = millis();
-  while (sent < size) {
-    int res = send(fd, buf + sent, size - sent, MSG_DONTWAIT);
-    if (res > 0) {
-      sent += res;
-      continue;
-    }
-    if (res < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-      nbrClientStops++;
-      client->stop();
-      return 0;
-    }
-    // Socket busy
-    if (sent == 0) {
-      nbrClientDrops++;
-      return 0;
-    }
-    if (millis() - start > CLIENT_PARTIAL_WRITE_MS) {
-      nbrClientStops++;
-      client->stop();
-      return 0;
-    }
-    vTaskDelay(1);
+  ClientBuffer* buffer = bufferFor(client, fd);
+  if (buffer == nullptr) {
+    // No buffer slot (should not happen): fall back to a direct attempt
+    int res = send(fd, buf, size, MSG_DONTWAIT);
+    if (res == (int)size)
+      return size;
+    nbrClientDrops++;
+    return 0;
   }
-  return sent;
+
+  if (!flushBuffer(client, buffer))
+    return 0;
+
+  if (buffer->len == 0) {
+    // Fast path: nothing pending, send directly and keep any remainder
+    int res = send(fd, buf, size, MSG_DONTWAIT);
+    if (res < 0) {
+      if (errno != EAGAIN && errno != EWOULDBLOCK) {
+        stopClient(client, buffer);
+        return 0;
+      }
+      res = 0;
+    }
+    if ((size_t)res == size)
+      return size;
+    buf += res;
+    size -= res;
+  }
+
+  if (buffer->len + size > CLIENT_BUFFER_SIZE) {
+    nbrClientDrops++;
+    return 0;
+  }
+  memcpy(buffer->data + buffer->len, buf, size);
+  buffer->len += size;
+  return size;
 #else
   if (client->availableForWrite() >= (int)size) {
     return client->write(buf, size);
   }
   nbrClientDrops++;
   return 0;
+#endif
+}
+
+// Push out buffered data for a client, called every data loop pass
+void clientFlush(WiFiClient* client) {
+#ifdef ESP32
+  int fd = client->fd();
+  for (int i = 0; i < CLIENT_BUFFER_SLOTS; i++) {
+    if (buffers[i].client == client) {
+      if (fd < 0 || buffers[i].fd != fd) {
+        buffers[i].len = 0;
+        return;
+      }
+      flushBuffer(client, &buffers[i]);
+      return;
+    }
+  }
+#else
+  (void)client;
 #endif
 }
 
