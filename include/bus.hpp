@@ -37,7 +37,8 @@ class BusType
     void end();
 
     // Is there a value available that should be send to a client?
-    bool   read(data& d);
+    // In asynchronous mode, waits up to waitTicks for data to arrive.
+    bool   read(data& d, uint32_t waitTicks = 0);
     size_t write(uint8_t symbol);
     int    availableForWrite();
     int    available();
@@ -52,6 +53,7 @@ class BusType
     ATOMIC_INT _nbrWon2;
     ATOMIC_INT _nbrErrors;
     ATOMIC_INT _nbrLate;
+    ATOMIC_INT _nbrOverflows; // symbols dropped because the queue was full
   private:
     inline void push    (const data& d);
            void receive (uint8_t symbol, unsigned long startBitTime);

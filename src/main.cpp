@@ -14,6 +14,7 @@ Preferences preferences;
 
 #ifdef ESP32
   #include <esp_task_wdt.h>
+  #include <Update.h>
   #include <ESPmDNS.h>
   #include "esp32c3/rom/rtc.h"
   #include <IotWebConfESP32HTTPUpdateServer.h>
@@ -56,7 +57,11 @@ WiFiClient serverClients[MAX_SRV_CLIENTS];
 WiFiClient serverClientsRO[MAX_SRV_CLIENTS];
 WiFiClient enhClients[MAX_SRV_CLIENTS];
 
-unsigned long last_comms = 0;
+// Last time bus data reached a connected client (or no client was connected).
+// Written by the data loop, read by the main loop.
+volatile unsigned long last_comms = 0;
+// Last time the main loop ran. Written by the main loop, read by the data loop.
+volatile unsigned long last_main_loop = 0;
 int last_reset_code = -1;
 
 unsigned long loopDuration = 0;
@@ -98,9 +103,18 @@ void on_connected(WiFiEvent_t event, WiFiEventInfo_t info){
 }
 #endif
 
+// Watchdogs on ESP32:
+// - The data loop is registered with the hardware task watchdog (TWDT) in
+//   data_loop() and feeds it every iteration. It must never block for long.
+// - The main loop is NOT registered with the TWDT, because OTA and HTTP
+//   firmware uploads legitimately block it for tens of seconds. Instead it
+//   updates last_main_loop, and the data loop resets the adapter when the
+//   main loop has not run for LOOP_STALL_RESET_MS (see check_main_loop()).
+// In v7.1.1 no task was registered, so the TWDT watched nothing.
 void wdt_start() {
 #ifdef ESP32
-  esp_task_wdt_init(6, true);
+  // The Arduino core already initialised the TWDT; this reconfigures it
+  esp_task_wdt_init(TASK_WDT_TIMEOUT_S, true);
 #elif defined(ESP8266)
   ESP.wdtDisable();
 #endif
@@ -108,7 +122,7 @@ void wdt_start() {
 
 void wdt_feed() {
 #ifdef ESP32
-  esp_task_wdt_reset();
+  last_main_loop = millis();
 #elif defined(ESP8266)
   ESP.wdtFeed();
 #else
@@ -224,6 +238,19 @@ void loop_duration() {
   }
 }
 
+bool any_client_connected(){
+  for (int i = 0; i < MAX_SRV_CLIENTS; i++){
+#ifdef ESP32
+    // fd() is cheap; a socket closed by the peer is stopped on the next write
+    if (serverClients[i].fd() >= 0 || serverClientsRO[i].fd() >= 0 || enhClients[i].fd() >= 0)
+#else
+    if (serverClients[i] || serverClientsRO[i] || enhClients[i])
+#endif
+      return true;
+  }
+  return false;
+}
+
 void data_process(){
   loop_duration();
 
@@ -233,9 +260,20 @@ void data_process(){
     handleEnhClient(&enhClients[i]);
   }
 
+  // Nobody to deliver to is not a communication failure
+  if (!any_client_connected()) {
+    last_comms = millis();
+  }
+
   //check queue for data
   BusType::data d;
+#ifdef ESP32
+  // Wait up to 1 tick for bus data instead of busy polling, so the idle task
+  // and other low priority tasks get CPU time
+  if (Bus.read(d, 1)) {
+#else
   if (Bus.read(d)) {
+#endif
     for (int i = 0; i < MAX_SRV_CLIENTS; i++){
       if (d._enhanced) {
         if (d._client == &enhClients[i]) {
@@ -261,11 +299,40 @@ void data_process(){
   }
 }
 
-void data_loop(void * pvParameters){
-  while(1){
-    data_process();
+#ifdef ESP32
+// Reset when the main loop (web server, Wi-Fi checks, client accept) is stuck.
+// Firmware updates block the main loop on purpose, so they get extra time.
+void check_main_loop(){
+  static unsigned long update_since = 0;
+  unsigned long now = millis();
+
+  if (Update.isRunning()) {
+    if (update_since == 0) {
+      update_since = now;
+    }
+    if (now - update_since < UPDATE_MAX_MS) {
+      return;
+    }
+  } else {
+    update_since = 0;
+  }
+
+  // Signed difference: last_main_loop may be updated after "now" was read
+  long stalled = (long)(now - last_main_loop);
+  if (stalled > (long)LOOP_STALL_RESET_MS) {
+    reset();
   }
 }
+
+void data_loop(void * pvParameters){
+  esp_task_wdt_add(NULL);
+  while(1){
+    esp_task_wdt_reset();
+    data_process();
+    check_main_loop();
+  }
+}
+#endif
 
 
 void saveParamsCallback () {
@@ -307,6 +374,9 @@ char* status_string(){
   pos += sprintf(status + pos, "nbr won2: %i\r\n", (int)Bus._nbrWon2);
   pos += sprintf(status + pos, "nbr late: %i\r\n", (int)Bus._nbrLate);
   pos += sprintf(status + pos, "nbr errors: %i\r\n", (int)Bus._nbrErrors);
+  pos += sprintf(status + pos, "nbr queue overflows: %i\r\n", (int)Bus._nbrOverflows);
+  pos += sprintf(status + pos, "nbr client drops: %lu\r\n", nbrClientDrops);
+  pos += sprintf(status + pos, "nbr client stops: %lu\r\n", nbrClientStops);
   pos += sprintf(status + pos, "pwm_value: %i\r\n", get_pwm());
 
   return status;
@@ -432,6 +502,8 @@ void setup() {
   wdt_start();
 
   last_comms = millis();
+  // Setup can take a while (Wi-Fi connect), don't count it as a stall
+  last_main_loop = millis();
 
 #ifdef ESP32
   xTaskCreate(data_loop, "data_loop", 10000, NULL, 1, &Task1);
@@ -471,7 +543,10 @@ void loop() {
     reset();
   }
 
-  if (millis() > last_comms + 200*1000 ) {
+  // Clients are connected but nothing reached any of them for too long.
+  // Signed difference: last_comms is updated by the data loop concurrently,
+  // and this form also survives the millis() overflow after 49 days.
+  if ((long)(millis() - last_comms) > (long)NO_COMMS_RESET_MS) {
     reset();
   }
 
@@ -493,4 +568,9 @@ void loop() {
 
   handleNewClient(wifiServerRO, serverClientsRO);
 
+#ifdef ESP32
+  // The Arduino loop task never yields by itself. Give the data loop, the
+  // idle task and lower priority tasks a chance to run.
+  vTaskDelay(1);
+#endif
 }

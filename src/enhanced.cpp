@@ -70,10 +70,17 @@ void encode(uint8_t c, uint8_t d, uint8_t (&data)[2]){
     data[1] = M2 | (d & 0b00111111);
 }
 
-void send_res(WiFiClient* client, uint8_t c, uint8_t d){
+// Best-effort error message, then drop the client. Never blocks.
+static void write_error_and_stop(WiFiClient* client, const char* message){
+    clientWrite(client, reinterpret_cast<const uint8_t*>(message), strlen(message));
+    client->stop();
+}
+
+// Returns true if the whole 2-byte frame was sent; never blocks (see clientWrite)
+bool send_res(WiFiClient* client, uint8_t c, uint8_t d){
     uint8_t data[2];
     encode(c, d, data);
-    client->write(data, 2);
+    return clientWrite(client, data, 2) == 2;
 }
 
 void process_cmd(WiFiClient* client, uint8_t c, uint8_t d){
@@ -137,9 +144,8 @@ bool read_cmd(WiFiClient* client, uint8_t (&data)[2]){
 
     if (b<0b11000000){
         DEBUG_LOG("first command signature error\n");
-        client->write("first command signature error");
         // first command signature error
-        client->stop();
+        write_error_and_stop(client, "first command signature error");
         return false;
     }
 
@@ -148,16 +154,14 @@ bool read_cmd(WiFiClient* client, uint8_t (&data)[2]){
     if (b2<0) {
         // second command missing
         DEBUG_LOG("second command missing\n");
-        client->write("second command missing");
-        client->stop();
+        write_error_and_stop(client, "second command missing");
         return false;
     }
 
     if ((b2 & 0b11000000) != 0b10000000){
         // second command signature error
         DEBUG_LOG("second command signature error\n");
-        client->write("second command signature error");
-        client->stop();
+        write_error_and_stop(client, "second command signature error");
         return false;
     }
 
@@ -179,11 +183,7 @@ int pushEnhClient(WiFiClient* client, uint8_t c, uint8_t d, bool log){
     if (log) {
         DEBUG_LOG("DATA           0x%02x 0x%02x\n", c, d);
     }
-    if (client->availableForWrite() >= AVAILABLE_THRESHOLD) {
-        send_res(client, c,  d);
-        return 1;
-    }
-    return 0;
+    return send_res(client, c, d) ? 1 : 0;
 }
 
 void enhArbitrationDone() {

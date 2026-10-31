@@ -31,7 +31,9 @@ BusType::BusType()
   , _nbrLost2(0)
   , _nbrWon1(0)
   , _nbrWon2(0)
-  , _nbrErrors(0) 
+  , _nbrErrors(0)
+  , _nbrLate(0)
+  , _nbrOverflows(0)
   , _client(0) {
 }
 
@@ -168,10 +170,11 @@ size_t BusType::write(uint8_t symbol) {
   return BusSer.write(symbol);
 }
 
-bool BusType::read(data& d) {
+bool BusType::read(data& d, uint32_t waitTicks) {
 #if USE_ASYNCHRONOUS
-    return xQueueReceive(_queue, &d, 0) == pdTRUE; 
+    return xQueueReceive(_queue, &d, waitTicks) == pdTRUE;
 #else
+    (void)waitTicks;
   #if USE_SOFTWARE_SERIAL
     if (mySerial.available()){
         uint8_t symbol = mySerial.read();
@@ -202,7 +205,9 @@ int BusType::available() {
 
 void BusType::push(const data& d){
 #if USE_ASYNCHRONOUS
-    xQueueSendToBack(_queue, &d, 0); 
+    if (xQueueSendToBack(_queue, &d, 0) != pdTRUE) {
+      _nbrOverflows++;
+    }
 #else
     _queue.push(d);
 #endif
